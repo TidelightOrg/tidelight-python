@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import json
+import hashlib
+from http.client import IncompleteRead
+import math
 import re
 import time
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any, Callable, Iterator
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlparse
@@ -57,6 +61,72 @@ class ResearchJob:
     request_id: str
 
 
+def _canonical_json(value: Any) -> str:
+    if value is None or isinstance(value, (str, bool)):
+        return _canonical_json_string(value)
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("Public capsule snapshots must contain finite numbers.")
+        if value == 0:
+            return "0"
+        raw = repr(value).lower()
+        magnitude = abs(value)
+        if 1e-6 <= magnitude < 1e21:
+            fixed = format(Decimal(raw), "f")
+            return fixed.rstrip("0").rstrip(".") if "." in fixed else fixed
+        mantissa, _, exponent = raw.partition("e")
+        if mantissa.endswith(".0"):
+            mantissa = mantissa[:-2]
+        exponent_value = int(exponent or "0")
+        return f"{mantissa}e{'+' if exponent_value >= 0 else ''}{exponent_value}"
+    if isinstance(value, list):
+        return "[" + ",".join(_canonical_json(item) for item in value) + "]"
+    if isinstance(value, dict) and all(isinstance(key, str) for key in value):
+        return "{" + ",".join(
+            _canonical_json_string(key) + ":" + _canonical_json(value[key])
+            for key in sorted(value)
+        ) + "}"
+    raise ValueError("Public capsule snapshots must contain JSON values only.")
+
+
+def _canonical_json_string(value: str | bool | None) -> str:
+    rendered = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    result: list[str] = []
+    index = 0
+    while index < len(rendered):
+        codepoint = ord(rendered[index])
+        if 0xD800 <= codepoint <= 0xDBFF and index + 1 < len(rendered):
+            low = ord(rendered[index + 1])
+            if 0xDC00 <= low <= 0xDFFF:
+                result.append(chr(0x10000 + ((codepoint - 0xD800) << 10) + low - 0xDC00))
+                index += 2
+                continue
+        if 0xD800 <= codepoint <= 0xDFFF:
+            result.append(f"\\u{codepoint:04x}")
+        else:
+            result.append(rendered[index])
+        index += 1
+    return "".join(result)
+
+
+def verify_public_decision_capsule(publication: dict[str, Any]) -> bool:
+    """Check the disclosed snapshot digest; this does not establish source truth or authorship."""
+    if not isinstance(publication, dict) or not isinstance(publication.get("snapshot"), dict):
+        return False
+    if publication.get("hashAlgorithm") != "sha256":
+        return False
+    expected = publication.get("integrityHash")
+    if not isinstance(expected, str) or not re.fullmatch(r"[a-f0-9]{64}", expected):
+        return False
+    try:
+        actual = hashlib.sha256(_canonical_json(publication.get("snapshot")).encode("utf-8")).hexdigest()
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return actual == expected
+
+
 class ApiError(Exception):
     def __init__(self, status: int, code: str, message: str, request_id: str | None = None):
         super().__init__(message)
@@ -65,8 +135,52 @@ class ApiError(Exception):
         self.request_id = request_id
 
 
+def get_public_decision_capsule(token: str, *, public_base_url: str = "https://tidelight.app", timeout: float = 10, max_retries: int = 2, opener: Callable[..., Any] | None = None, sleeper: Callable[[float], None] = time.sleep) -> dict[str, Any]:
+    if not isinstance(token, str) or not re.fullmatch(r"[A-Za-z0-9_-]{43}", token):
+        raise ValueError("Invalid public capsule token.")
+    public = urlparse(public_base_url)
+    local_public = public.scheme == "http" and public.hostname in {"localhost", "127.0.0.1"}
+    if (public.scheme != "https" and not local_public) or (public.scheme == "https" and not public.hostname) or (public.scheme == "https" and public.port not in (None, 443)) or public.path not in ("", "/") or public.username or public.password or public.query or public.fragment:
+        raise ValueError("The public capsule URL must use HTTPS or a local development origin.")
+    if not 0.1 <= timeout <= 120 or not isinstance(max_retries, int) or not 0 <= max_retries <= 5:
+        raise ValueError("Public capsule timeout or retry limit is out of range.")
+    transport = opener or build_opener(_NoRedirect()).open
+    pause = sleeper
+    request = Request(f"{public_base_url.rstrip('/')}/api/decision-capsules/public/{token}", headers={"Accept": "application/json"})
+    for attempt in range(max_retries + 1):
+        try:
+            with transport(request, timeout=timeout) as response:
+                try:
+                    payload = json.load(response)
+                except ValueError:
+                    raise ApiError(getattr(response, "status", 0), "invalid_response", "The public capsule response is invalid.") from None
+        except HTTPError as error:
+            try:
+                body = json.load(error)
+                details = body.get("error", {}) if isinstance(body, dict) else {}
+                if isinstance(details, str):
+                    details = {"message": details}
+                if not isinstance(details, dict):
+                    details = {}
+            except (ValueError, AttributeError, OSError, IncompleteRead):
+                details = {}
+            if error.code in {429, 502, 503, 504} and attempt < max_retries:
+                pause(min(5.0, float(error.headers.get("Retry-After", 0) or 0)) if str(error.headers.get("Retry-After", "")).isdigit() else min(2.0, 0.25 * 2 ** attempt))
+                continue
+            raise ApiError(error.code, details.get("code", "public_capsule_error"), details.get("message", "Public capsule request failed."), details.get("request_id") or error.headers.get("X-Request-Id")) from None
+        except (URLError, TimeoutError, OSError, IncompleteRead):
+            if attempt >= max_retries:
+                raise ApiError(0, "network_error", "The public capsule could not be reached.") from None
+            pause(min(2.0, 0.25 * 2 ** attempt))
+            continue
+        if not isinstance(payload, dict) or payload.get("schemaVersion") != 1 or not isinstance(payload.get("snapshot"), dict) or payload.get("integrity") != "valid" or not verify_public_decision_capsule(payload):
+            raise ApiError(409, "integrity_verification_failed", "Public capsule integrity verification failed.")
+        return payload
+    raise RuntimeError("Unreachable retry state")
+
+
 class Client:
-    def __init__(self, api_key: str, *, base_url: str = "https://api.tidelight.app/v1", timeout: float = 10, max_retries: int = 2, opener: Callable[..., Any] | None = None, sleeper: Callable[[float], None] = time.sleep):
+    def __init__(self, api_key: str, *, base_url: str = "https://api.tidelight.app/v1", public_base_url: str = "https://tidelight.app", timeout: float = 10, max_retries: int = 2, opener: Callable[..., Any] | None = None, sleeper: Callable[[float], None] = time.sleep):
         if not re.fullmatch(r"tl_(test|live)_[A-Za-z0-9_-]{43}", api_key):
             raise ValueError("A valid Tidelight API key is required.")
         parsed = urlparse(base_url)
@@ -76,16 +190,24 @@ class Client:
             raise ValueError("The API URL must use api.tidelight.app over HTTPS.")
         if parsed.username or parsed.password or parsed.query or parsed.fragment:
             raise ValueError("The API URL cannot contain credentials, query, or fragment.")
+        public = urlparse(public_base_url)
+        local_public = public.scheme == "http" and public.hostname in {"localhost", "127.0.0.1"}
+        if (public.scheme != "https" and not local_public) or (public.scheme == "https" and not public.hostname) or (public.scheme == "https" and public.port not in (None, 443)) or public.path not in ("", "/") or public.username or public.password or public.query or public.fragment:
+            raise ValueError("The public capsule URL must use HTTPS or a local development origin.")
         if not 0.1 <= timeout <= 120:
             raise ValueError("timeout must be 0.1 to 120 seconds.")
         if not isinstance(max_retries, int) or not 0 <= max_retries <= 5:
             raise ValueError("max_retries must be 0 to 5.")
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
+        self._public_base_url = public_base_url.rstrip("/")
         self._timeout = timeout
         self._max_retries = max_retries
         self._opener = opener or build_opener(_NoRedirect()).open
         self._sleeper = sleeper
+
+    def get_public_decision_capsule(self, token: str) -> dict[str, Any]:
+        return get_public_decision_capsule(token, public_base_url=self._public_base_url, timeout=self._timeout, max_retries=self._max_retries, opener=self._opener, sleeper=self._sleeper)
 
     def list_tokenized_equities(self, *, limit: int = 20, cursor: str | None = None, underlying_ticker: str | None = None) -> InstrumentPage:
         if not isinstance(limit, int) or not 1 <= limit <= 100:
@@ -145,6 +267,16 @@ class Client:
         if not isinstance(idempotency_key, str) or not re.fullmatch(r"[A-Za-z0-9._:-]{8,128}", idempotency_key):
             raise ValueError("idempotency_key must be 8 to 128 valid characters.")
         return self._job_request("/research/jobs", "POST", {"ticker": ticker}, idempotency_key)
+
+    def research_with_agentkey(self, query: str, *, ticker: str | None = None) -> dict[str, Any]:
+        if not isinstance(query, str) or not 5 <= len(query.strip()) <= 500:
+            raise ValueError("query must be 5 to 500 characters.")
+        if ticker is not None and (not isinstance(ticker, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9.]{0,9}", ticker)):
+            raise ValueError("ticker must be a valid stock symbol.")
+        body: dict[str, Any] = {"query": " ".join(query.split())}
+        if ticker is not None:
+            body["ticker"] = ticker.upper()
+        return self._job_request("/research/agentkey", "POST", body, retry_safe=False, timeout=45)
 
     def get_research_job(self, job_id: str) -> ResearchJob:
         if not isinstance(job_id, str) or not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", job_id, re.I):
@@ -224,7 +356,7 @@ class Client:
         cls._validate_webhook_url(url)
         cls._validate_webhook_events(events)
 
-    def _job_request(self, path: str, method: str, body: dict[str, Any] | None = None, idempotency_key: str | None = None, *, retry_safe: bool = True) -> dict[str, Any]:
+    def _job_request(self, path: str, method: str, body: dict[str, Any] | None = None, idempotency_key: str | None = None, *, retry_safe: bool = True, timeout: float | None = None) -> dict[str, Any]:
         headers = {"Authorization": f"Bearer {self._api_key}", "Accept": "application/json"}
         data = None
         if body is not None:
@@ -234,10 +366,11 @@ class Client:
             headers["Idempotency-Key"] = idempotency_key
         url = f"{self._base_url}{path}"
         retry_limit = self._max_retries if retry_safe else 0
+        request_timeout = self._timeout if timeout is None else timeout
         for attempt in range(retry_limit + 1):
             request = Request(url, data=data, headers=headers, method=method)
             try:
-                with self._opener(request, timeout=self._timeout) as response:
+                with self._opener(request, timeout=request_timeout) as response:
                     payload = json.load(response)
                     if not isinstance(payload, dict):
                         raise ApiError(response.status, "invalid_response", "The Tidelight API returned an invalid response.", response.headers.get("X-Request-Id"))
@@ -251,7 +384,7 @@ class Client:
                     self._pause(attempt, error.headers.get("Retry-After")); continue
                 raise ApiError(error.code, details.get("code", "api_error"), details.get("message", "Tidelight API request failed."), details.get("request_id") or error.headers.get("X-Request-Id")) from None
             except (URLError, TimeoutError, OSError):
-                if attempt >= self._max_retries:
+                if attempt >= retry_limit:
                     raise ApiError(0, "network_error", "The Tidelight API could not be reached.") from None
                 self._pause(attempt, None)
         raise RuntimeError("Unreachable retry state")
